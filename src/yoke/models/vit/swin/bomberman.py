@@ -35,7 +35,7 @@ class LodeRunner(nn.Module):
 
     Parallel-patch embedding with SWIN U-Net backbone and
     unpatchification. This module will take in a variable-channel image format
-    and output an equivalent variable-channel image formate. This will serves
+    and output an equivalent variable-channel image format. This will serves
     as a prototype foundational architecture for multi-material, multi-physics,
     surrogate models.
 
