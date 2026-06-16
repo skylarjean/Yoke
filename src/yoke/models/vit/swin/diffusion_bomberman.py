@@ -305,102 +305,97 @@ class DiffusionLodeRunner(nn.Module):
 
 class VPNoiseSchedule:
     """Variance-preserving (VP) noise schedule.
-    
+
     Implements the VP forward diffusion process:
         y_t = alpha(t) * y + sigma(t) * epsilon
     where alpha(t)^2 + sigma(t)^2 = 1
-    
+
     Uses a cosine schedule for smooth interpolation.
     """
-    
-    def __init__(self, beta_min: float = 0.1, beta_max: float = 20.0):
-        """Initialize VP noise schedule.
-        
-        Args:
-            beta_min: Minimum noise level (at t=0).
-            beta_max: Maximum noise level (at t=1).
-        """
-        self.beta_min = beta_min
-        self.beta_max = beta_max
-    
+
+    def __init__(self) -> None:
+        """Initialization for VP noise schedule."""
+        #Skylar has no idea if we need the init for anything
+        #and is increasingly weirded out by how the AI wants to finish my thoughts
+        #let me have my own thoughts please
+        pass
+
     def alpha(self, t: torch.Tensor) -> torch.Tensor:
-        """Compute α(t) coefficient.
-        
+        """Compute coefficient alpha(t) = cos(pi*t/2).
+
         Args:
             t: Diffusion time in [0, 1], shape (B,) or (B, 1).
-            
+
         Returns:
-            α(t) values, same shape as t.
+            alpha(t) values, same shape as t.
         """
-        # Cosine schedule: α(t) = cos(π*t/2)
         return torch.cos(math.pi * t / 2.0)
     
     def sigma(self, t: torch.Tensor) -> torch.Tensor:
-        """Compute σ(t) coefficient.
-        
+        """Compute coefficient sigma(t) = sin(pi*t/2).
+
         Args:
             t: Diffusion time in [0, 1], shape (B,) or (B, 1).
-            
+
         Returns:
-            σ(t) values, same shape as t.
+            sigma(t) values, same shape as t.
         """
-        # Ensure VP constraint: σ(t) = sin(π*t/2)
         return torch.sin(math.pi * t / 2.0)
-    
+
     def forward_diffusion(
         self, y: torch.Tensor, t: torch.Tensor, noise: torch.Tensor = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply forward diffusion process.
-        
+
+        Implements: y_t = alpha(t) * y + sigma(t) * noise.
+
         Args:
             y: Clean target of shape (B, C, H, W).
             t: Diffusion time in [0, 1], shape (B,).
             noise: Optional pre-sampled noise. If None, samples from N(0, I).
-            
+
         Returns:
-            Tuple of (y_t, noise) where:
-                y_t: Noised target of shape (B, C, H, W).
-                noise: The noise that was added, shape (B, C, H, W).
+            y_t: Noised target of shape (B, C, H, W).
+            noise: The noise that was added, shape (B, C, H, W).
         """
         if noise is None:
             noise = torch.randn_like(y)
-        
+
         # Reshape t for broadcasting: (B,) -> (B, 1, 1, 1)
         t_expanded = t.view(-1, 1, 1, 1)
-        
+
         # Compute coefficients
         alpha_t = self.alpha(t_expanded)
         sigma_t = self.sigma(t_expanded)
-        
+
         # Apply VP forward process: y_t = α(t)*y + σ(t)*ε
         y_t = alpha_t * y + sigma_t * noise
-        
+
         return y_t, noise
-    
-    def predict_x0_from_noise(
-        self, y_t: torch.Tensor, t: torch.Tensor, noise_pred: torch.Tensor
+
+    def remove_noise(
+        self, y_t: torch.Tensor, t: torch.Tensor, noise: torch.Tensor
     ) -> torch.Tensor:
-        """Predict clean target from noised version and predicted noise.
-        
-        Implements: ŷ_0 = (y_t - σ(t)*ε̂) / α(t)
-        
+        """Removes noise from target data.
+
+        Implements: ŷ_0 = (y_t - sigma(t)*noise) / alpha(t)
+
         Args:
             y_t: Noised target of shape (B, C, H, W).
             t: Diffusion time in [0, 1], shape (B,).
-            noise_pred: Predicted noise of shape (B, C, H, W).
-            
+            noise: noise of shape (B, C, H, W).
+
         Returns:
-            Predicted clean target of shape (B, C, H, W).
+            Denoised target of shape (B, C, H, W).
         """
         # Reshape t for broadcasting
         t_expanded = t.view(-1, 1, 1, 1)
-        
+
         alpha_t = self.alpha(t_expanded)
         sigma_t = self.sigma(t_expanded)
-        
-        # Predict x0: (y_t - σ(t)*ε̂) / α(t)
-        y0_pred = (y_t - sigma_t * noise_pred) / (alpha_t + 1e-8)
-        
+
+        y0_pred = (y_t - sigma_t * noise) / (alpha_t + 1e-8)
+
         return y0_pred
 
 
