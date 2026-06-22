@@ -401,10 +401,10 @@ class VPNoiseSchedule:
 
 class Lightning_DiffusionLodeRunner(LightningModule):
     """Lightning wrapper for DiffusionLodeRunner.
-    
+
     Wraps DiffusionLodeRunner in a LightningModule for training with
     denoising score matching objective.
-    
+
     Args:
         model (nn.Module): Pre-initialized DiffusionLodeRunner model.
         in_vars (torch.Tensor): Input variable indices for conditioning.
@@ -414,7 +414,7 @@ class Lightning_DiffusionLodeRunner(LightningModule):
         loss_fn (Callable): Loss function for noise prediction (default: MSE).
         noise_schedule (VPNoiseSchedule): VP noise schedule for diffusion.
     """
-    
+
     def __init__(
         self,
         model: nn.Module,
@@ -432,11 +432,11 @@ class Lightning_DiffusionLodeRunner(LightningModule):
         self.scheduler_params = scheduler_params or {}
         self.loss_fn = loss_fn
         self.noise_schedule = noise_schedule or VPNoiseSchedule()
-        
+
         # Register buffers for device management
         self.register_buffer("in_vars", in_vars)
         self.register_buffer("out_vars", out_vars)
-    
+
     def configure_optimizers(self) -> dict:
         """Setup optimizer with scheduler."""
         optimizer = torch.optim.AdamW(self.model.parameters())
@@ -449,29 +449,29 @@ class Lightning_DiffusionLodeRunner(LightningModule):
                 "frequency": 1,
             },
         }
-    
+
     def training_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
         """Execute training step with denoising score matching.
-        
+
         Args:
             batch: Tuple of (x, y, lead_times) where:
                 x: Conditioning input of shape (B, C_in, H, W).
                 y: Clean target of shape (B, C_out, H, W).
                 lead_times: Lead time values of shape (B,).
             batch_idx: Batch index.
-            
+
         Returns:
             Loss value.
         """
         x, y, lead_times = batch
-        
+
         # Sample diffusion times uniformly from [0, 1]
         batch_size = x.shape[0]
         t = torch.rand(batch_size, device=x.device)
-        
+
         # Apply forward diffusion to get noised targets
         y_t, noise = self.noise_schedule.forward_diffusion(y, t)
-        
+
         # Predict noise
         noise_pred = self.model(
             x=x,
@@ -481,31 +481,34 @@ class Lightning_DiffusionLodeRunner(LightningModule):
             lead_times=lead_times,
             diffusion_time=t,
         )
-        
+
         # Compute loss (MSE between predicted and true noise)
         loss = self.loss_fn(noise_pred, noise)
-        
+
         # Log metrics
         self.log("train_loss", loss, sync_dist=True, prog_bar=True)
-        
+
         return loss
-    
+
     def validation_step(self, batch: tuple, batch_idx: int) -> None:
         """Execute validation step.
-        
+
         Args:
-            batch: Tuple of (x, y, lead_times).
+            batch: Tuple of (x, y, lead_times) where:
+                x: Conditioning input of shape (B, C_in, H, W).
+                y: Clean target of shape (B, C_out, H, W).
+                lead_times: Lead time values of shape (B,).
             batch_idx: Batch index.
         """
         x, y, lead_times = batch
-        
+
         # Sample diffusion times
         batch_size = x.shape[0]
         t = torch.rand(batch_size, device=x.device)
-        
+
         # Apply forward diffusion
         y_t, noise = self.noise_schedule.forward_diffusion(y, t)
-        
+
         # Predict noise
         noise_pred = self.model(
             x=x,
@@ -515,13 +518,13 @@ class Lightning_DiffusionLodeRunner(LightningModule):
             lead_times=lead_times,
             diffusion_time=t,
         )
-        
+
         # Compute loss
         loss = self.loss_fn(noise_pred, noise)
-        
+
         # Log metrics
         self.log("val_loss", loss, sync_dist=True, prog_bar=True)
-    
+
     @torch.no_grad()
     def sample(
         self,
@@ -531,36 +534,36 @@ class Lightning_DiffusionLodeRunner(LightningModule):
         eta: float = 0.0,
     ) -> torch.Tensor:
         """Sample from the learned conditional distribution using DDIM.
-        
+
         Args:
             x: Conditioning input of shape (B, C_in, H, W).
             lead_times: Lead time values of shape (B,).
             num_steps: Number of denoising steps.
             eta: DDIM stochasticity parameter (0 = deterministic).
-            
+
         Returns:
             Sampled predictions of shape (B, C_out, H, W).
         """
         batch_size = x.shape[0]
         device = x.device
-        
+
         # Initialize from pure noise
         # Determine output shape from out_vars
         num_out_vars = len(self.out_vars)
         y_t = torch.randn(
             batch_size, num_out_vars, *self.model.image_size, device=device
         )
-        
+
         # Create reverse diffusion schedule
         timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
-        
+
         for i in range(num_steps):
             t_current = timesteps[i]
             t_next = timesteps[i + 1]
-            
+
             # Broadcast to batch
             t_batch = t_current.repeat(batch_size)
-            
+
             # Predict noise
             noise_pred = self.model(
                 x=x,
@@ -570,12 +573,12 @@ class Lightning_DiffusionLodeRunner(LightningModule):
                 lead_times=lead_times,
                 diffusion_time=t_batch,
             )
-            
+
             # Predict x0
-            y0_pred = self.noise_schedule.predict_x0_from_noise(
+            y0_pred = self.noise_schedule.remove_noise(
                 y_t, t_batch, noise_pred
             )
-            
+
             # DDIM update (deterministic when eta=0)
             if t_next > 0:
                 t_next_batch = t_next.repeat(batch_size)
@@ -585,12 +588,11 @@ class Lightning_DiffusionLodeRunner(LightningModule):
                 sigma_next = self.noise_schedule.sigma(
                     t_next_batch.view(-1, 1, 1, 1)
                 )
-                
+
                 # DDIM formula: y_{t-1} = α_{t-1}*ŷ_0 + σ_{t-1}*ε̂
                 y_t = alpha_next * y0_pred + sigma_next * noise_pred
             else:
                 # Final step: return predicted x0
                 y_t = y0_pred
-        
-        return y_t
 
+        return y_t
