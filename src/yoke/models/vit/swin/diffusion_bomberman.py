@@ -31,14 +31,14 @@ from yoke.helpers.training_design import validate_patch_and_window
 class DiffusionTimeEmbed(nn.Module):
     """Diffusion time encoding/embedding.
 
-    Encodes the diffusion time parameter t ∈ [0,1] into a learned embedding
+    Encodes the diffusion time parameter tau (τ) ∈ [0,1] into a learned embedding
     of dimension embed_dim, analogous to TimeEmbed for lead times.
 
     This embedding is used to help track/tag each entry of a batch by it's
-    corresponding lead time. After variable aggregation and position encoding,
-    temporal encoding is added to patch tokens.
+    corresponding diffusion time. After variable aggregation and position encoding,
+    diffusion time encoding is added to patch tokens.
 
-    This embedding consists of a single 1D linear embedding of lead-times per
+    This embedding consists of a single 1D linear embedding of diffusion times per
     sample in the batch to the embedding dimension.
 
     NOTE: Entries for image_size and patch_size should divide eachother evenly.
@@ -80,9 +80,9 @@ class DiffusionLodeRunner(nn.Module):
 
     The model conditions on:
     - Input fields x (conditioning stream)
-    - Noised target fields y_t (noised-target stream)
-    - Lead time τ (temporal offset)
-    - Diffusion time t ∈ [0,1] (noise level)
+    - Noised target fields y_tau (noised-target stream)
+    - Lead time delta_t (Δt) (temporal offset)
+    - Diffusion time tau (τ) ∈ [0,1] (noise level)
 
     Args:
         default_vars (list[str]): List of default variables to be used for training.
@@ -173,9 +173,9 @@ class DiffusionLodeRunner(nn.Module):
             self.parallel_embed_x.num_patches,
         )
 
-        # ===== Stream B: Noised-target stream (noised fields y_t) =====
+        # ===== Stream B: Noised-target stream (noised fields y_tau) =====
         # Parallel patch embedding for noised target variables
-        self.parallel_embed_yt = ParallelVarPatchEmbed(
+        self.parallel_embed_y_tau = ParallelVarPatchEmbed(
             max_vars=self.max_vars,
             img_size=self.image_size,
             patch_size=self.patch_size,
@@ -184,24 +184,24 @@ class DiffusionLodeRunner(nn.Module):
         )
 
         # Variable embedding for noised-target stream
-        self.var_embed_yt = VarEmbed(self.default_vars, self.embed_dim)
+        self.var_embed_y_tau = VarEmbed(self.default_vars, self.embed_dim)
 
         # Variable aggregation for noised-target stream
-        self.agg_vars_yt = AggVars(self.embed_dim, self.num_heads)
+        self.agg_vars_y_tau = AggVars(self.embed_dim, self.num_heads)
 
         # Position embedding for noised-target stream
-        self.pos_embed_yt = PosEmbed(
+        self.pos_embed_y_tau = PosEmbed(
             self.embed_dim,
             self.patch_size,
             self.image_size,
-            self.parallel_embed_yt.num_patches,
+            self.parallel_embed_y_tau.num_patches,
         )
 
         # ===== Temporal conditioning =====
-        # Lead-time encoding (τ)
+        # Lead-time encoding (Δt)
         self.temporal_encoding = TimeEmbed(self.embed_dim)
 
-        # Diffusion-time encoding (t)
+        # Diffusion-time encoding (τ)
         self.diffusion_time_encoding = DiffusionTimeEmbed(self.embed_dim)
 
         # ===== SWIN U-Net backbone =====
@@ -232,7 +232,7 @@ class DiffusionLodeRunner(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        y_t: torch.Tensor,
+        y_tau: torch.Tensor,
         in_vars: torch.Tensor,
         out_vars: torch.Tensor,
         lead_times: torch.Tensor,
@@ -242,7 +242,7 @@ class DiffusionLodeRunner(nn.Module):
 
         Args:
             x: Conditioning input fields of shape (B, C_in, H, W).
-            y_t: Noised target fields of shape (B, C_out, H, W).
+            y_tau: Noised target fields of shape (B, C_out, H, W).
             in_vars: Tensor of variable indices for input (conditioning) variables.
             out_vars: Tensor of variable indices for output (target) variables.
             lead_times: Lead time values of shape (B,) for temporal conditioning.
@@ -264,27 +264,27 @@ class DiffusionLodeRunner(nn.Module):
         # Encode patch positions for conditioning
         z_x = self.pos_embed_x(z_x)  # (B, N, D)
 
-        # ===== Stream B: Process noised target y_t =====
+        # ===== Stream B: Process noised target y_tau =====
         # Embed noised target
-        z_yt = self.parallel_embed_yt(y_t, out_vars)  # (B, N, D)
+        z_y_tau = self.parallel_embed_y_tau(y_tau, out_vars)  # (B, N, D)
 
         # Encode target variables
-        z_yt = self.var_embed_yt(z_yt, out_vars)  # (B, N, D)
+        z_y_tau = self.var_embed_y_tau(z_y_tau, out_vars)  # (B, N, D)
 
         # Aggregate target variables
-        z_yt = self.agg_vars_yt(z_yt)  # (B, N, D)
+        z_y_tau = self.agg_vars_y_tau(z_y_tau)  # (B, N, D)
 
         # Encode patch positions for target
-        z_yt = self.pos_embed_yt(z_yt)  # (B, N, D)
+        z_y_tau = self.pos_embed_y_tau(z_y_tau)  # (B, N, D)
 
         # ===== Token fusion: Additive combination of streams =====
-        z = z_x + z_yt  # (B, N, D)
+        z = z_x + z_y_tau  # (B, N, D)
 
         # ===== Temporal conditioning =====
-        # Encode lead time τ
+        # Encode lead time Δt
         z = self.temporal_encoding(z, lead_times)  # (B, N, D)
 
-        # Encode diffusion time t
+        # Encode diffusion time τ
         z = self.diffusion_time_encoding(z, diffusion_time)  # (B, N, D)
 
         # ===== SWIN U-Net backbone =====
@@ -307,94 +307,92 @@ class VPNoiseSchedule:
     """Variance-preserving (VP) noise schedule.
 
     Implements the VP forward diffusion process:
-        y_t = alpha(t) * y + sigma(t) * epsilon
-    where alpha(t)^2 + sigma(t)^2 = 1
+        y_tau = alpha(tau) * y + sigma(tau) * epsilon
+    where alpha(tau)^2 + sigma(tau)^2 = 1
 
     Uses a cosine schedule for smooth interpolation.
     """
 
     def __init__(self) -> None:
         """Initialization for VP noise schedule."""
-        #Skylar has no idea if we need the init for anything
-        #and is increasingly weirded out by how the AI wants to finish my thoughts
-        #let me have my own thoughts please
+        #I don't know if we need an init
         pass
 
-    def alpha(self, t: torch.Tensor) -> torch.Tensor:
-        """Compute coefficient alpha(t) = cos(pi*t/2).
+    def alpha(self, tau: torch.Tensor) -> torch.Tensor:
+        """Compute coefficient alpha(tau) = cos(pi*tau/2).
 
         Args:
-            t: Diffusion time in [0, 1], shape (B,) or (B, 1).
+            tau: Diffusion time in [0, 1], shape (B,) or (B, 1).
 
         Returns:
-            alpha(t) values, same shape as t.
+            alpha(tau) values, same shape as tau.
         """
-        return torch.cos(math.pi * t / 2.0)
-    
-    def sigma(self, t: torch.Tensor) -> torch.Tensor:
-        """Compute coefficient sigma(t) = sin(pi*t/2).
+        return torch.cos(math.pi * tau / 2.0)
+
+    def sigma(self, tau: torch.Tensor) -> torch.Tensor:
+        """Compute coefficient sigma(tau) = sin(pi*tau/2).
 
         Args:
-            t: Diffusion time in [0, 1], shape (B,) or (B, 1).
+            tau: Diffusion time in [0, 1], shape (B,) or (B, 1).
 
         Returns:
-            sigma(t) values, same shape as t.
+            sigma(tau) values, same shape as tau.
         """
-        return torch.sin(math.pi * t / 2.0)
+        return torch.sin(math.pi * tau / 2.0)
 
     def forward_diffusion(
-        self, y: torch.Tensor, t: torch.Tensor, noise: torch.Tensor = None
+        self, y: torch.Tensor, tau: torch.Tensor, noise: torch.Tensor = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply forward diffusion process.
 
-        Implements: y_t = alpha(t) * y + sigma(t) * noise.
+        Implements: y_tau = alpha(tau) * y + sigma(tau) * noise.
 
         Args:
             y: Clean target of shape (B, C, H, W).
-            t: Diffusion time in [0, 1], shape (B,).
+            tau: Diffusion time in [0, 1], shape (B,).
             noise: Optional pre-sampled noise. If None, samples from N(0, I).
 
         Returns:
-            y_t: Noised target of shape (B, C, H, W).
+            y_tau: Noised target of shape (B, C, H, W).
             noise: The noise that was added, shape (B, C, H, W).
         """
         if noise is None:
             noise = torch.randn_like(y)
 
-        # Reshape t for broadcasting: (B,) -> (B, 1, 1, 1)
-        t_expanded = t.view(-1, 1, 1, 1)
+        # Reshape tau for broadcasting: (B,) -> (B, 1, 1, 1)
+        tau_expanded = tau.view(-1, 1, 1, 1)
 
         # Compute coefficients
-        alpha_t = self.alpha(t_expanded)
-        sigma_t = self.sigma(t_expanded)
+        alpha_tau = self.alpha(tau_expanded)
+        sigma_tau = self.sigma(tau_expanded)
 
-        # Apply VP forward process: y_t = α(t)*y + σ(t)*ε
-        y_t = alpha_t * y + sigma_t * noise
+        # Apply VP forward process: y_tau = α(τ)*y + σ(τ)*ε
+        y_tau = alpha_tau * y + sigma_tau * noise
 
-        return y_t, noise
+        return y_tau, noise
 
     def remove_noise(
-        self, y_t: torch.Tensor, t: torch.Tensor, noise: torch.Tensor
+        self, y_tau: torch.Tensor, tau: torch.Tensor, noise: torch.Tensor
     ) -> torch.Tensor:
         """Removes noise from target data.
 
-        Implements: ŷ_0 = (y_t - sigma(t)*noise) / alpha(t)
+        Implements: ŷ_0 = (y_tau - sigma(tau)*noise) / alpha(tau)
 
         Args:
-            y_t: Noised target of shape (B, C, H, W).
-            t: Diffusion time in [0, 1], shape (B,).
+            y_tau: Noised target of shape (B, C, H, W).
+            tau: Diffusion time in [0, 1], shape (B,).
             noise: noise of shape (B, C, H, W).
 
         Returns:
             Denoised target of shape (B, C, H, W).
         """
-        # Reshape t for broadcasting
-        t_expanded = t.view(-1, 1, 1, 1)
+        # Reshape tau for broadcasting
+        tau_expanded = tau.view(-1, 1, 1, 1)
 
-        alpha_t = self.alpha(t_expanded)
-        sigma_t = self.sigma(t_expanded)
+        alpha_tau = self.alpha(tau_expanded)
+        sigma_tau = self.sigma(tau_expanded)
 
-        y0_pred = (y_t - sigma_t * noise) / (alpha_t + 1e-8)
+        y0_pred = (y_tau - sigma_tau * noise) / (alpha_tau + 1e-8)
 
         return y0_pred
 
@@ -467,19 +465,19 @@ class Lightning_DiffusionLodeRunner(LightningModule):
 
         # Sample diffusion times uniformly from [0, 1]
         batch_size = x.shape[0]
-        t = torch.rand(batch_size, device=x.device)
+        tau = torch.rand(batch_size, device=x.device)
 
         # Apply forward diffusion to get noised targets
-        y_t, noise = self.noise_schedule.forward_diffusion(y, t)
+        y_tau, noise = self.noise_schedule.forward_diffusion(y, tau)
 
         # Predict noise
         noise_pred = self.model(
             x=x,
-            y_t=y_t,
+            y_tau=y_tau,
             in_vars=self.in_vars,
             out_vars=self.out_vars,
             lead_times=lead_times,
-            diffusion_time=t,
+            diffusion_time=tau,
         )
 
         # Compute loss (MSE between predicted and true noise)
@@ -504,19 +502,19 @@ class Lightning_DiffusionLodeRunner(LightningModule):
 
         # Sample diffusion times
         batch_size = x.shape[0]
-        t = torch.rand(batch_size, device=x.device)
+        tau = torch.rand(batch_size, device=x.device)
 
         # Apply forward diffusion
-        y_t, noise = self.noise_schedule.forward_diffusion(y, t)
+        y_tau, noise = self.noise_schedule.forward_diffusion(y, tau)
 
         # Predict noise
         noise_pred = self.model(
             x=x,
-            y_t=y_t,
+            y_tau=y_tau,
             in_vars=self.in_vars,
             out_vars=self.out_vars,
             lead_times=lead_times,
-            diffusion_time=t,
+            diffusion_time=tau,
         )
 
         # Compute loss
@@ -550,7 +548,7 @@ class Lightning_DiffusionLodeRunner(LightningModule):
         # Initialize from pure noise
         # Determine output shape from out_vars
         num_out_vars = len(self.out_vars)
-        y_t = torch.randn(
+        y_tau = torch.randn(
             batch_size, num_out_vars, *self.model.image_size, device=device
         )
 
@@ -558,41 +556,41 @@ class Lightning_DiffusionLodeRunner(LightningModule):
         timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
 
         for i in range(num_steps):
-            t_current = timesteps[i]
-            t_next = timesteps[i + 1]
+            tau_current = timesteps[i]
+            tau_next = timesteps[i + 1]
 
             # Broadcast to batch
-            t_batch = t_current.repeat(batch_size)
+            tau_batch = tau_current.repeat(batch_size)
 
             # Predict noise
             noise_pred = self.model(
                 x=x,
-                y_t=y_t,
+                y_tau=y_tau,
                 in_vars=self.in_vars,
                 out_vars=self.out_vars,
                 lead_times=lead_times,
-                diffusion_time=t_batch,
+                diffusion_time=tau_batch,
             )
 
             # Predict x0
             y0_pred = self.noise_schedule.remove_noise(
-                y_t, t_batch, noise_pred
+                y_tau, tau_batch, noise_pred
             )
 
             # DDIM update (deterministic when eta=0)
-            if t_next > 0:
-                t_next_batch = t_next.repeat(batch_size)
+            if tau_next > 0:
+                tau_next_batch = tau_next.repeat(batch_size)
                 alpha_next = self.noise_schedule.alpha(
-                    t_next_batch.view(-1, 1, 1, 1)
+                    tau_next_batch.view(-1, 1, 1, 1)
                 )
                 sigma_next = self.noise_schedule.sigma(
-                    t_next_batch.view(-1, 1, 1, 1)
+                    tau_next_batch.view(-1, 1, 1, 1)
                 )
 
                 # DDIM formula: y_{t-1} = α_{t-1}*ŷ_0 + σ_{t-1}*ε̂
-                y_t = alpha_next * y0_pred + sigma_next * noise_pred
+                y_tau = alpha_next * y0_pred + sigma_next * noise_pred
             else:
                 # Final step: return predicted x0
-                y_t = y0_pred
+                y_tau = y0_pred
 
-        return y_t
+        return y_tau
